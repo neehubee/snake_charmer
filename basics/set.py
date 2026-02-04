@@ -1,0 +1,6 @@
+s=set()
+s.add(5)
+s.remove(5)
+print(5 in s)
+t=((1,5),(1,2))
+print(t[0])
