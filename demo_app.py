@@ -1,5 +1,5 @@
-
 import streamlit as st
+import requests  # ADD THIS IMPORT
 import random
 import base64
 from PIL import Image, ImageDraw
@@ -10,7 +10,130 @@ import torch
 from transformers import DistilBertModel, DistilBertTokenizerFast
 import pandas as pd
 
+# ---------------------------------
+# ADD MISSING FUNCTIONS FIRST
+# ---------------------------------
+
+def call_yolo_api(image_file):
+    """
+    Call your LOCAL YOLO+ResNet API
+    Returns: JSON with equipment counts and corrosion level
+    """
+    try:
+        # Send image to your local API
+        files = {"file": image_file.getvalue()}
+        
+        # Call your API running on localhost:8000
+        response = requests.post(
+            "http://localhost:8000/analyze",
+            files=files,
+            timeout=30  # Give time for ML models
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"API Error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        st.error(f"❌ Cannot connect to YOLO API: {str(e)}")
+        st.info("💡 Make sure your API is running: python main.py")
+        return None
+#image score calc -dynamic
+def calculate_image_risk(api_results):
+    """
+    Convert YOLO+ResNet API results to a 0-1 risk score
+    FIXED VERSION - handles your corrosion labels correctly
+    """
+    if not api_results:
+        print("DEBUG: No API results, returning 0.5")
+        return 0.5
+    
+    try:
+        # DEBUG: Print what we're receiving
+        print("=" * 50)
+        print("DEBUG calculate_image_risk:")
+        print(f"Full API results: {api_results}")
+        
+        # Get corrosion level from your API response
+        condition = api_results.get("condition_analysis", {})
+        corrosion = str(condition.get("corrosion_level", "unknown")).strip()
+        confidence = condition.get("confidence", 0.5)
+        
+        print(f"Corrosion raw: '{corrosion}'")
+        print(f"Confidence: {confidence}")
+        
+        # Normalize corrosion string (handle your specific labels)
+        corrosion_lower = corrosion.lower()
+        
+        # Your corrosion labels are: "High-corrosion", "Medium-corrosion", "Low-corrosion"
+        # Map them to risk scores
+        corrosion_map = {
+            "high-corrosion": 0.9,
+            "high": 0.9,
+            "severe": 1.0,
+            "medium-corrosion": 0.6,
+            "medium": 0.6,
+            "moderate": 0.6,
+            "low-corrosion": 0.3,
+            "low": 0.3,
+            "none": 0.1,
+            "unknown": 0.5
+        }
+        
+        # Find matching key (handles partial matches)
+        base_score = 0.5  # Default
+        for key, score in corrosion_map.items():
+            if key in corrosion_lower:
+                base_score = score
+                print(f"Matched '{key}' -> score {score}")
+                break
+        
+        print(f"Base corrosion score: {base_score}")
+        
+        # Adjust with confidence
+        adjusted_score = base_score * (0.5 + 0.5 * confidence)
+        print(f"Adjusted with confidence: {adjusted_score}")
+        
+        # Add equipment risk
+        equipment = api_results.get("equipment_analysis", {})
+        print(f"Equipment: {equipment}")
+        
+        equipment_risk = 0.0
+        if equipment:
+            # Count total equipment as proxy for complexity/risk
+            total_items = sum(equipment.values())
+            equipment_risk = min(0.3, total_items * 0.05)  # Max 0.3 from equipment
+            
+            # Extra risk for damaged equipment
+            damage_keywords = ["damage", "crack", "rust", "broken", "missing", "bent", "leaning"]
+            for keyword in damage_keywords:
+                for item in equipment.keys():
+                    if keyword in str(item).lower():
+                        equipment_risk += 0.1  # Extra for damage
+                        print(f"Found damage keyword '{keyword}' in '{item}'")
+        
+        print(f"Equipment risk: {equipment_risk}")
+        
+        # Calculate total score
+        total_score = min(1.0, adjusted_score + equipment_risk)
+        print(f"Total score: {total_score}")
+        print("=" * 50)
+        
+        return round(total_score, 2)
+        
+    except Exception as e:
+        print(f"ERROR in calculate_image_risk: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0.5
+
+# ---------------------------------
+# YOUR EXISTING NLP CODE
+# ---------------------------------
 pipeline = joblib.load("risk_pipeline.pkl")
+
 @st.cache_resource
 def load_models():
     tokenizer = DistilBertTokenizerFast.from_pretrained("bert_model")
@@ -18,10 +141,11 @@ def load_models():
     classifier = joblib.load("risk_classifier.pkl")
     label_encoders = joblib.load("label_encoders.pkl")
     return tokenizer, bert_model, classifier, label_encoders
+
 tokenizer, bert_model, classifier, label_encoders = load_models()
 bert_model.eval()  # IMPORTANT
 
-    # -------- PREDICTION FUNCTION --------
+# -------- PREDICTION FUNCTION --------
 def get_bert_embedding(text):
     # tokenize text
     inputs = tokenizer(text, padding=True, truncation=True, return_tensors="pt")
@@ -66,65 +190,51 @@ def predict_log(log_text):
     
     return results if results else {}
 
-def normalize_predictions(results):
-    return {
-        "risk_category": results["risk_category"].title(),   # high → High
-        "severity": results["severity"].title(),             # catastrophic → Catastrophic
-        "urgency": (
-            "Immediate" if results["urgency"].lower() in ["urgent", "immediate"]
-            else results["urgency"].title()
-        ),
-        "safety_hazard": (
-            True if str(results.get("is_safety_hazard")).lower() in ["yes", "true", "1"]
-            else False
-        )
+def calculate_log_threat_score(risk_category, severity, urgency, safety_hazard):
+    """
+    Compute a normalized threat score in [0, 1] from model outputs.
+
+    Parameters accepted as strings (e.g. 'high', 'medium'), booleans, or numeric-like values.
+    The function maps common categorical labels to numeric weights and combines
+    them with tuned component weights to produce a single score.
+    """
+    def _map(val, mapping, default=0.5):
+        if isinstance(val, str):
+            return mapping.get(val.strip().lower(), default)
+        if isinstance(val, bool):
+            return 1.0 if val else 0.0
+        try:
+            return float(val)
+        except Exception:
+            return default
+
+    risk_map = {
+        'critical': 1.0, 'critical_risk': 1.0, 'high': 0.9, 'medium': 0.6,
+        'moderate': 0.6, 'low': 0.2, 'minor': 0.2, 'none': 0.0
+    }
+    severity_map = {
+        'critical': 1.0, 'severe': 1.0, 'high': 0.9, 'major': 0.9,
+        'medium': 0.6, 'moderate': 0.6, 'low': 0.2, 'minor': 0.2
+    }
+    urgency_map = {
+        'immediate': 1.0, 'now': 1.0, 'urgent': 0.9, 'soon': 0.6,
+        'routine': 0.2, 'low': 0.2, 'none': 0.0
     }
 
-# -----------------------------
-# RULE-BASED SCORE CALCULATION
-# -----------------------------
+    r = _map(risk_category, risk_map, default=0.5)
+    s = _map(severity, severity_map, default=0.5)
+    u = _map(urgency, urgency_map, default=0.5)
 
-RISK_CATEGORY_SCORE = {
-    "Low": 0.2,
-    "Medium": 0.5,
-    "High": 0.9
-}
+    if isinstance(safety_hazard, str):
+        sh = 1.0 if safety_hazard.strip().lower() in ('yes', 'true', 'y', '1') else 0.0
+    else:
+        sh = 1.0 if bool(safety_hazard) else 0.0
 
-SEVERITY_SCORE = {
-    "Negligible": 0.1,
-    "Minor": 0.4,
-    "Major": 0.7,
-    "Catastrophic": 1.0
-}
+    # Component weights (sum to 1.0)
+    w_r, w_s, w_u, w_sh = 0.4, 0.35, 0.2, 0.05
 
-URGENCY_SCORE = {
-    "Routine": 0.2,
-    "Scheduled": 0.5,
-    "Immediate": 0.9
-}
-
-SAFETY_HAZARD_SCORE = {
-    False: 0.0,
-    True: 1.0
-}
-
-def rule_based_log_score(normalized):
-    """
-    Takes normalized model outputs and returns final log threat score
-    """
-    rc = RISK_CATEGORY_SCORE.get(normalized["risk_category"], 0.5)
-    sev = SEVERITY_SCORE.get(normalized["severity"], 0.5)
-    urg = URGENCY_SCORE.get(normalized["urgency"], 0.5)
-    sh = SAFETY_HAZARD_SCORE.get(normalized["safety_hazard"], 0.0)
-
-    score = (
-        0.35 * rc +
-        0.35 * sev +
-        0.20 * urg +
-        0.10 * sh
-    )
-
-    return round(score, 3)
+    score = r * w_r + s * w_s + u * w_u + sh * w_sh
+    return max(0.0, min(1.0, score))
 
 # ---------------------------------
 # PAGE CONFIGURATION
@@ -309,6 +419,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 # ---------------------------------
 # FEATURE SECTION (Exactly like the screenshot)
 # ---------------------------------
@@ -559,7 +670,6 @@ section[data-testid="stMain"] {
 </style>
 """, unsafe_allow_html=True)
 
-
 # ---------------------------------
 # HEADER
 # ---------------------------------
@@ -576,39 +686,90 @@ st.write("")
 # TABS
 # ---------------------------------
 tab1, tab2, tab3 = st.tabs([
-    " Image Inspection",
-    " Technician Log Analysis",
-    " Risk & Severity Dashboard"
+    "📸 Image Inspection",
+    "📝 Technician Log Analysis", 
+    "📊 Risk & Severity Dashboard"
 ])
 
 # ---------------------------------
-# TAB 1 – IMAGE ANALYSIS
+# TAB 1 – IMAGE ANALYSIS (UPDATED)
 # ---------------------------------
 with tab1:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader(" Visual Structural Inspection (YOLOv8)")
-
+    st.subheader("🔍 Visual Structural Inspection (YOLOv8 + ResNet)")
+    
+    # API Status Check
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("📡 Check API Connection", type="secondary"):
+            try:
+                response = requests.get("http://localhost:8000/", timeout=5)
+                if response.status_code == 200:
+                    st.success("✅ API Connected")
+                else:
+                    st.warning(f"⚠️ API returned {response.status_code}")
+            except Exception as e:
+                st.error(f"❌ API Not Found: {e}")
+                st.info("Run: python main.py in another terminal")
+    
     uploaded_file = st.file_uploader(
-        "Upload tower image",
+        "Upload telecom tower image",
         type=["jpg", "png", "jpeg"]
     )
-
+    
     if uploaded_file:
+        # Show preview
         image = Image.open(uploaded_file)
-        draw = ImageDraw.Draw(image)
-        w, h = image.size
-        draw.rectangle(
-            [w*0.25, h*0.25, w*0.6, h*0.6],
-            outline="#ef4444",
-            width=6
-        )
-
-        st.image(image, use_container_width=True)
-        st.error("🔴 Critical corrosion detected on tower structure")
-
-    else:
-        st.info("Upload an image to begin AI inspection")
-
+        st.image(image, caption="Uploaded Image", use_container_width=True)
+        
+        # Analyze button
+        if st.button("🚀 Run AI Analysis", type="primary"):
+            with st.spinner("Analyzing with YOLO+ResNet..."):
+                # Call YOUR YOLO+ResNet API
+                results = call_yolo_api(uploaded_file)
+                
+                if results:
+                    st.success("✅ Analysis Complete!")
+                    
+                    # Display equipment counts
+                    equipment = results.get("equipment_analysis", {})
+                    if equipment:
+                        st.subheader("📊 Detected Equipment")
+                        # Create columns for equipment display
+                        cols = st.columns(3)
+                        for i, (item, count) in enumerate(equipment.items()):
+                            with cols[i % 3]:
+                                st.metric(item.replace("_", " ").title(), count)
+                    
+                    # Display corrosion analysis
+                    condition = results.get("condition_analysis", {})
+                    corrosion = condition.get("corrosion_level", "unknown")
+                    confidence = condition.get("confidence", 0)
+                    
+                    st.subheader("⚠️ Condition Assessment")
+                    
+                    # Color-coded corrosion alert
+                    corrosion_lower = str(corrosion).lower()
+                    if "high" in corrosion_lower or "severe" in corrosion_lower:
+                        st.error(f"🔴 CORROSION: {corrosion.upper()} (Confidence: {confidence:.1%})")
+                    elif "medium" in corrosion_lower:
+                        st.warning(f"🟡 Corrosion: {corrosion} (Confidence: {confidence:.1%})")
+                    else:
+                        st.success(f"🟢 Corrosion: {corrosion} (Confidence: {confidence:.1%})")
+                    
+                    # Calculate and show risk score
+                    risk_score = calculate_image_risk(results)
+                    st.metric("📈 Image Risk Score", f"{risk_score:.2f}/1.0")
+                    
+                    # Save for Tab 3 dashboard
+                    st.session_state['last_image_score'] = risk_score
+                    
+                    # Optional: Show raw data
+                    with st.expander("📄 View Detailed Results"):
+                        st.json(results)
+                else:
+                    st.error("Failed to get analysis results")
+    
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------------
@@ -616,7 +777,7 @@ with tab1:
 # ---------------------------------
 with tab2:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("Technician Log Intelligence")
+    st.subheader("📝 Technician Log Intelligence")
 
     log = st.text_area(
         "Paste inspection log",
@@ -624,75 +785,99 @@ with tab2:
         placeholder="Example: Severe corrosion observed near base leg..."
     )
 
+    # -------- RUN MODEL --------
     if log:
-        # Step 1: Model prediction
         results = predict_log(log)
 
-        # Step 2: Normalize labels
-        normalized = normalize_predictions(results)
+        risk_category = results.get("risk_category", "unknown")
+        severity = results.get("severity", "medium")
+        urgency = results.get("urgency", "routine")
+        safety_hazard = results.get("is_safety_hazard", False)
 
-        # Step 3: Rule-based score
-        log_score = rule_based_log_score(normalized)
-
-        # ---------------------------------
-        # MODEL OUTPUTS
-        # ---------------------------------
-        st.subheader(" Model Outputs")
-
-        st.write("**Risk Category:**", normalized["risk_category"])
-        st.write("**Severity:**", normalized["severity"])
-        st.write("**Urgency:**", normalized["urgency"])
-        st.write(
-            "**Safety Hazard:**",
-            "Yes 🚨" if normalized["safety_hazard"] else "No"
+        log_score = calculate_log_threat_score(
+            risk_category, severity, urgency, safety_hazard
         )
 
-        # ---------------------------------
-        # FINAL SCORE
-        # ---------------------------------
-        st.subheader(" Log Threat Score")
-        st.metric("Threat Score", f"{log_score} / 1.00")
+        st.metric("Log Risk Score", f"{log_score:.2f} / 1.0")
 
-        # ---------------------------------
-        # STATUS MESSAGE
-        # ---------------------------------
-        if log_score >= 0.75:
-            st.error(" CRITICAL RISK — Immediate Action Required")
-        elif log_score >= 0.4:
-            st.warning(" MODERATE RISK — Schedule Inspection")
+        if log_score > 0.75:
+            st.error("🔴 High Risk Log Detected")
+        elif log_score > 0.5:
+            st.warning("🟡 Medium Risk Log")
         else:
-            st.success(" LOW RISK — No Immediate Threat")
+            st.success("🟢 Low Risk Log")
+            
+        # Save for Tab 3 dashboard
+        st.session_state['last_nlp_score'] = log_score
 
-    st.markdown("</div>", unsafe_allow_html=True) 
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------------
-# TAB 3 – RISK DASHBOARD
+# TAB 3 – RISK DASHBOARD (UPDATED)
 # ---------------------------------
 with tab3:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("🚨 Unified Threat Severity Assessment")
-
-    score = random.randint(55, 95)
-
-    st.metric("Overall Severity Score", f"{score}/100")
-
-    if score >= 75:
-        st.markdown("<span class='badge-red'>IMMEDIATE ACTION REQUIRED</span>",
-                    unsafe_allow_html=True)
+    st.subheader("📊 Unified Threat Severity Assessment")
+    
+    # Get scores (with defaults)
+    image_score = st.session_state.get('last_image_score', 0.5)
+    nlp_score = st.session_state.get('last_nlp_score', 0.5)
+    
+    # Combined score (60% image, 40% NLP)
+    overall_score = (image_score * 0.6) + (nlp_score * 0.4)
+    
+    # Display overall score
+    st.metric("Overall Risk Score", f"{overall_score:.2f}/1.0")
+    
+    # Progress bar visualization
+    st.progress(float(overall_score))
+    
+    # Score breakdown
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Image Analysis Score", f"{image_score:.2f}")
+    with col2:
+        st.metric("Log Analysis Score", f"{nlp_score:.2f}")
+    
+    # Risk level and recommendations
+    st.subheader("🚨 Risk Assessment")
+    
+    if overall_score > 0.7:
+        st.error("""
+        🔴 **CRITICAL RISK** - IMMEDIATE ACTION REQUIRED
+        - Dispatch emergency inspection team
+        - Consider temporary shutdown
+        - Notify safety authorities
+        """)
+        st.markdown("<span class='badge-red'>IMMEDIATE ACTION REQUIRED</span>", unsafe_allow_html=True)
+    elif overall_score > 0.4:
+        st.warning("""
+        🟡 **MODERATE RISK** - SCHEDULE INSPECTION
+        - Schedule inspection within 7 days
+        - Monitor daily
+        - Prepare maintenance resources
+        """)
+        st.markdown("<span class='badge-orange'>MONITOR & SCHEDULE INSPECTION</span>", unsafe_allow_html=True)
     else:
-        st.markdown("<span class='badge-orange'>MONITOR & SCHEDULE INSPECTION</span>",
-                    unsafe_allow_html=True)
+        st.success("""
+        🟢 **LOW RISK** - NORMAL OPERATION
+        - Continue routine monitoring
+        - Schedule next quarterly inspection
+        - No immediate action needed
+        """)
 
     st.write("")
-    st.subheader("Risk Contribution Breakdown")
+    st.subheader("📈 Risk Contribution Breakdown")
 
-    st.bar_chart({
-        "Corrosion": 45,
-        "Cracks": 20,
-        "Foundation Shift": 15,
-        "Loose Cabling": 10,
-        "Environmental Stress": 10
-    })
+    # Create dynamic risk breakdown
+    risk_data = {
+        "Visual Defects": min(50, image_score * 50),
+        "Log Severity": min(30, nlp_score * 30),
+        "Equipment Issues": min(15, image_score * 15),
+        "Other Factors": 5
+    }
+    
+    st.bar_chart(risk_data)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -703,4 +888,8 @@ st.markdown("""
 <div class="footer">
 © 2026 • Bi-Modal Telecom Risk Monitor • AI-Powered Infrastructure Safety
 </div>
-""", unsafe_allow_html=True) 
+""", unsafe_allow_html=True)
+
+# ---------------------------------
+# SIDEBAR WITH API INFO
+# ---------------------------------
